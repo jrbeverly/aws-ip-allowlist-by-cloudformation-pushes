@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFront WAF IP set synchronization stack.
+  Must be deployed in us-east-1. Creates CloudFront-scoped WAF IP sets
+  (IPv4, IPv6, or both) for a single external IP feed, with an
+  EventBridge-triggered Lambda synchronizer and SSM discovery parameters.
+  One feed binding per stack. Each deployment manages exactly one external source.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Feed Identity
+        Parameters:
+          - pFeedName
+      - Label:
+          default: Feed Source
+        Parameters:
+          - pSourceType
+          - pSourceLocation
+          - pSourceS3Bucket
+      - Label:
+          default: Schedule
+        Parameters:
+          - pScheduleExpression
+      - Label:
+          default: Resource Configuration
+        Parameters:
+          - pEnableIPv4
+          - pEnableIPv6
+          - pIpv4Addresses
+          - pIpv6Addresses
+      - Label:
+          default: SSM Discovery Outputs
+        Parameters:
+          - pParameterPathRoot
+          - pPublishResourceArn
+          - pPublishResourceId
+      - Label:
+          default: Lambda Synchronizer
+        Parameters:
+          - pLambdaRuntime
+          - pLambdaHandler
+          - pLambdaCodeS3Bucket
+          - pLambdaCodeS3Key
+    ParameterLabels:
+      pFeedName:
+        default: Feed name
+      pSourceType:
+        default: Source type
+      pSourceLocation:
+        default: Source location
+      pScheduleExpression:
+        default: Schedule expression
+      pEnableIPv4:
+        default: Enable IPv4
+      pEnableIPv6:
+        default: Enable IPv6
+      pIpv4Addresses:
+        default: IPv4 CIDRs (comma-separated)
+      pIpv6Addresses:
+        default: IPv6 CIDRs (comma-separated)
+      pSourceS3Bucket:
+        default: S3 source bucket
+      pParameterPathRoot:
+        default: SSM parameter path root
+      pPublishResourceArn:
+        default: Publish resource ARN to SSM
+      pPublishResourceId:
+        default: Publish resource ID to SSM
+      pLambdaRuntime:
+        default: Lambda runtime
+      pLambdaHandler:
+        default: Lambda handler
+      pLambdaCodeS3Bucket:
+        default: Lambda code S3 bucket
+      pLambdaCodeS3Key:
+        default: Lambda code S3 key
+
+Parameters:
+  # --- Feed Identity ---
+  pFeedName:
+    Type: String
+    Description: Logical name for this feed. Used in resource naming and SSM parameter paths. One feed per stack.
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+    ConstraintDescription: Alphanumeric characters, hyphens, and underscores only.
+
+  # --- Feed Source ---
+  pSourceType:
+    Type: String
+    Description: Protocol for retrieving the external IP feed.
+    AllowedValues:
+      - HTTP
+      - S3
+    Default: HTTP
+
+  pSourceLocation:
+    Type: String
+    Description: URL (for HTTP) or S3 URI (for S3) of the external IP feed payload.
+    MinLength: 1
+    MaxLength: 2048
+
+  pSourceS3Bucket:
+    Type: String
+    Description: S3 bucket name containing the feed file. Required when SourceType is S3. Ignored for HTTP feeds.
+    MinLength: 0
+    MaxLength: 63
+    Default: ''
+
+  # --- Schedule ---
+  pScheduleExpression:
+    Type: String
+    Description: EventBridge cron or rate expression for recurring synchronization.
+    MinLength: 1
+    MaxLength: 256
+    Default: 'rate(1 hour)'
+
+  # --- Resource Configuration ---
+  pEnableIPv4:
+    Type: String
+    Description: Create an IPv4 WAF IP set for this feed.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  pEnableIPv6:
+    Type: String
+    Description: Create an IPv6 WAF IP set for this feed.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'false'
+
+  pIpv4Addresses:
+    Type: String
+    Description: Comma-separated list of IPv4 CIDRs. Managed by the synchronizer runtime and passed as a parameter override during UpdateStack.
+    MinLength: 1
+    MaxLength: 10240
+    Default: '0.0.0.0/32'
+
+  pIpv6Addresses:
+    Type: String
+    Description: Comma-separated list of IPv6 CIDRs. Managed by the synchronizer runtime and passed as a parameter override during UpdateStack.
+    MinLength: 1
+    MaxLength: 10240
+    Default: '::/128'
+
+  # --- SSM Discovery Outputs ---
+  pParameterPathRoot:
+    Type: String
+    Description: Root path for SSM discovery parameters. Must start and end with '/'.
+    MinLength: 2
+    MaxLength: 256
+    AllowedPattern: '^\/[a-zA-Z0-9\/_-]+\/$'
+    ConstraintDescription: Must start and end with '/', e.g. /ip-allowlist/
+    Default: '/ip-allowlist/'
+
+  pPublishResourceArn:
+    Type: String
+    Description: Publish the WAF IP set ARN as an SSM parameter for downstream discovery.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  pPublishResourceId:
+    Type: String
+    Description: Publish the WAF IP set ID as an SSM parameter for downstream discovery.
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Default: 'true'
+
+  # --- Lambda Synchronizer ---
+  pLambdaRuntime:
+    Type: String
+    Description: Lambda runtime for the synchronizer function.
+    AllowedValues:
+      - python3.12
+      - python3.11
+      - nodejs22.x
+    Default: python3.12
+
+  pLambdaHandler:
+    Type: String
+    Description: Lambda handler entrypoint for the synchronizer function.
+    MinLength: 1
+    MaxLength: 128
+    Default: 'index.handler'
+
+  pLambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the synchronizer Lambda deployment package.
+    MinLength: 1
+    MaxLength: 63
+
+  pLambdaCodeS3Key:
+    Type: String
+    Description: S3 key for the synchronizer Lambda deployment package.
+    MinLength: 1
+    MaxLength: 1024
+    Default: 'ip-allowlist-sync/latest/function.zip'
+
+Conditions:
+  HasIPv4: !Equals [!Ref pEnableIPv4, 'true']
+  HasIPv6: !Equals [!Ref pEnableIPv6, 'true']
+  PublishArn: !Equals [!Ref pPublishResourceArn, 'true']
+  PublishId: !Equals [!Ref pPublishResourceId, 'true']
+  PublishArnIPv4: !And [!Condition HasIPv4, !Condition PublishArn]
+  PublishArnIPv6: !And [!Condition HasIPv6, !Condition PublishArn]
+  PublishIdIPv4: !And [!Condition HasIPv4, !Condition PublishId]
+  PublishIdIPv6: !And [!Condition HasIPv6, !Condition PublishId]
+  IsSourceS3: !Equals [!Ref pSourceType, 'S3']
+
+Resources:
+  # --- WAF IP Sets ---
+  IpSetIPv4:
+    Condition: HasIPv4
+    Type: AWS::WAFv2::IPSet
+    Metadata:
+      IpSync:
+        Version: '1.0'
+        FeedName: !Ref pFeedName
+        ResourceKind: WAF_IP_SET
+        AddressFamily: IPv4
+        Scope: CLOUDFRONT
+        ManagedProperties:
+          - Addresses
+    Properties:
+      Name: !Sub '${pFeedName}-ipv4'
+      Description: !Sub 'IPv4 IP set for feed ${pFeedName}. Synchronized from external source. Managed by ip-allowlist-sync.'
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Addresses: !Split [',', !Ref pIpv4Addresses]
+      Tags:
+        - Key: ip-allowlist:feed-name
+          Value: !Ref pFeedName
+        - Key: ip-allowlist:sync-role
+          Value: sync-target
+        - Key: ip-allowlist:address-family
+          Value: IPv4
+        - Key: ip-allowlist:stack-variant
+          Value: waf-cloudfront
+
+  IpSetIPv6:
+    Condition: HasIPv6
+    Type: AWS::WAFv2::IPSet
+    Metadata:
+      IpSync:
+        Version: '1.0'
+        FeedName: !Ref pFeedName
+        ResourceKind: WAF_IP_SET
+        AddressFamily: IPv6
+        Scope: CLOUDFRONT
+        ManagedProperties:
+          - Addresses
+    Properties:
+      Name: !Sub '${pFeedName}-ipv6'
+      Description: !Sub 'IPv6 IP set for feed ${pFeedName}. Synchronized from external source. Managed by ip-allowlist-sync.'
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV6
+      Addresses: !Split [',', !Ref pIpv6Addresses]
+      Tags:
+        - Key: ip-allowlist:feed-name
+          Value: !Ref pFeedName
+        - Key: ip-allowlist:sync-role
+          Value: sync-target
+        - Key: ip-allowlist:address-family
+          Value: IPv6
+        - Key: ip-allowlist:stack-variant
+          Value: waf-cloudfront
+
+  # --- SSM Discovery Parameters ---
+  SsmIPv4Arn:
+    Condition: PublishArnIPv4
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${pParameterPathRoot}IPSets/${pFeedName}/ipv4/arn'
+      Description: !Sub 'ARN of the IPv4 CloudFront WAF IP set for feed ${pFeedName}'
+      Type: String
+      Value: !GetAtt IpSetIPv4.Arn
+
+  SsmIPv4Id:
+    Condition: PublishIdIPv4
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${pParameterPathRoot}IPSets/${pFeedName}/ipv4/id'
+      Description: !Sub 'ID of the IPv4 CloudFront WAF IP set for feed ${pFeedName}'
+      Type: String
+      Value: !GetAtt IpSetIPv4.Id
+
+  SsmIPv6Arn:
+    Condition: PublishArnIPv6
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${pParameterPathRoot}IPSets/${pFeedName}/ipv6/arn'
+      Description: !Sub 'ARN of the IPv6 CloudFront WAF IP set for feed ${pFeedName}'
+      Type: String
+      Value: !GetAtt IpSetIPv6.Arn
+
+  SsmIPv6Id:
+    Condition: PublishIdIPv6
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${pParameterPathRoot}IPSets/${pFeedName}/ipv6/id'
+      Description: !Sub 'ID of the IPv6 CloudFront WAF IP set for feed ${pFeedName}'
+      Type: String
+      Value: !GetAtt IpSetIPv6.Id
+
+  # --- CloudFormation Service Role (resource mutation) ---
+  UpdateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${pFeedName}-update-role-${AWS::Region}'
+      Description: !Sub 'CloudFormation service role for updating CloudFront WAF IP sets owned by feed ${pFeedName}. CloudFormation assumes this role during stack updates.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${pFeedName}-waf-update'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:UpdateIPSet
+                  - wafv2:ListTagsForResource
+                Resource: !If
+                  - HasIPv4
+                  - !If
+                    - HasIPv6
+                    - - !GetAtt IpSetIPv4.Arn
+                      - !GetAtt IpSetIPv6.Arn
+                    - - !GetAtt IpSetIPv4.Arn
+                  - !If
+                    - HasIPv6
+                    - - !GetAtt IpSetIPv6.Arn
+                    - - !Sub 'arn:${AWS::Partition}:wafv2:${AWS::Region}:${AWS::AccountId}:ipset/placeholder'
+              # CloudFormation re-resolves GetAtt on dependents of the changed resource.
+              - Effect: Allow
+                Action:
+                  - iam:GetRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${pFeedName}-*'
+              - Effect: Allow
+                Action:
+                  - events:DescribeRule
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${pFeedName}-sync-schedule'
+
+  # --- EventBridge Schedule ---
+  SyncScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${pFeedName}-sync-schedule'
+      Description: !Sub 'Scheduled trigger for IP allowlist synchronization of feed ${pFeedName}'
+      ScheduleExpression: !Ref pScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SyncFunction.Arn
+          Id: !Sub '${pFeedName}-sync-target'
+
+  # --- IAM Role (Lambda execution) ---
+  SyncFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${pFeedName}-sync-role-${AWS::Region}'
+      Description: !Sub 'Execution role for the IP allowlist synchronizer Lambda for feed ${pFeedName}. Delegates resource mutation to CloudFormation via the update role.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: !Sub '${pFeedName}-sync-execution'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:GetTemplate
+                Resource: !Ref AWS::StackId
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:UpdateStack
+                Resource: !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt UpdateRole.Arn
+              - !If
+                - IsSourceS3
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                  Resource: !Sub 'arn:${AWS::Partition}:s3:::${pSourceS3Bucket}/*'
+                - !Ref AWS::NoValue
+
+  # --- Lambda Function ---
+  SyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${pFeedName}-sync'
+      Description: !Sub 'Synchronizes external IP feed ${pFeedName} into CloudFront WAF IP sets'
+      Runtime: !Ref pLambdaRuntime
+      Handler: !Ref pLambdaHandler
+      Code:
+        S3Bucket: !Ref pLambdaCodeS3Bucket
+        S3Key: !Ref pLambdaCodeS3Key
+      Role: !GetAtt SyncFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          IP_ALLOWLIST_FEED_NAME: !Ref pFeedName
+          IP_ALLOWLIST_SOURCE_TYPE: !Ref pSourceType
+          IP_ALLOWLIST_SOURCE_LOCATION: !Ref pSourceLocation
+          IP_ALLOWLIST_PARAMETER_PATH_ROOT: !Ref pParameterPathRoot
+          IP_ALLOWLIST_WAF_SCOPE: CLOUDFRONT
+          IP_ALLOWLIST_RESOURCE_KIND: WAF_IP_SET
+          IP_ALLOWLIST_WAF_IPV4_IPSET_ID: !If [HasIPv4, !GetAtt IpSetIPv4.Id, '']
+          IP_ALLOWLIST_WAF_IPV4_IPSET_NAME: !If [HasIPv4, !Sub '${pFeedName}-ipv4', '']
+          IP_ALLOWLIST_WAF_IPV6_IPSET_ID: !If [HasIPv6, !GetAtt IpSetIPv6.Id, '']
+          IP_ALLOWLIST_WAF_IPV6_IPSET_NAME: !If [HasIPv6, !Sub '${pFeedName}-ipv6', '']
+          IP_ALLOWLIST_PUBLISH_ARN: !Ref pPublishResourceArn
+          IP_ALLOWLIST_PUBLISH_ID: !Ref pPublishResourceId
+          IP_ALLOWLIST_STACK_NAME: !Ref AWS::StackName
+          IP_ALLOWLIST_UPDATE_ROLE_ARN: !GetAtt UpdateRole.Arn
+      Tags:
+        - Key: ip-allowlist:feed-name
+          Value: !Ref pFeedName
+        - Key: ip-allowlist:sync-role
+          Value: sync-function
+        - Key: ip-allowlist:stack-variant
+          Value: waf-cloudfront
+
+  # --- Lambda Permission for EventBridge ---
+  SyncFunctionEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SyncFunction.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SyncScheduleRule.Arn
+
+Outputs:
+  # --- Feed Identity ---
+  FeedName:
+    Description: Logical name of the feed managed by this stack.
+    Value: !Ref pFeedName
+
+  # --- Deployment Constraint ---
+  DeploymentRegionConstraint:
+    Description: This stack must be deployed in us-east-1. CloudFront-scoped WAF resources are only available in us-east-1.
+    Value: us-east-1
+
+  # --- WAF IP Sets (conditional) ---
+  IpSetIPv4Id:
+    Condition: HasIPv4
+    Description: ID of the IPv4 CloudFront WAF IP set. Published to SSM if pPublishResourceId is true.
+    Value: !GetAtt IpSetIPv4.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-ipset-ipv4-id'
+
+  IpSetIPv4Arn:
+    Condition: HasIPv4
+    Description: ARN of the IPv4 CloudFront WAF IP set. Published to SSM if pPublishResourceArn is true.
+    Value: !GetAtt IpSetIPv4.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ipset-ipv4-arn'
+
+  IpSetIPv6Id:
+    Condition: HasIPv6
+    Description: ID of the IPv6 CloudFront WAF IP set. Published to SSM if pPublishResourceId is true.
+    Value: !GetAtt IpSetIPv6.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-ipset-ipv6-id'
+
+  IpSetIPv6Arn:
+    Condition: HasIPv6
+    Description: ARN of the IPv6 CloudFront WAF IP set. Published to SSM if pPublishResourceArn is true.
+    Value: !GetAtt IpSetIPv6.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ipset-ipv6-arn'
+
+  # --- SSM Parameter Paths ---
+  SsmIPv4ArnPath:
+    Condition: PublishArnIPv4
+    Description: SSM parameter path for the IPv4 IP set ARN.
+    Value: !Ref SsmIPv4Arn
+
+  SsmIPv4IdPath:
+    Condition: PublishIdIPv4
+    Description: SSM parameter path for the IPv4 IP set ID.
+    Value: !Ref SsmIPv4Id
+
+  SsmIPv6ArnPath:
+    Condition: PublishArnIPv6
+    Description: SSM parameter path for the IPv6 IP set ARN.
+    Value: !Ref SsmIPv6Arn
+
+  SsmIPv6IdPath:
+    Condition: PublishIdIPv6
+    Description: SSM parameter path for the IPv6 IP set ID.
+    Value: !Ref SsmIPv6Id
+
+  # --- Synchronizer ---
+  SyncFunctionArn:
+    Description: ARN of the Lambda synchronizer function.
+    Value: !GetAtt SyncFunction.Arn
+
+  SyncFunctionRoleArn:
+    Description: ARN of the IAM role used by the synchronizer Lambda.
+    Value: !GetAtt SyncFunctionRole.Arn
+
+  UpdateRoleArn:
+    Description: ARN of the CloudFormation service role that performs CloudFront WAF IP set mutations during stack updates.
+    Value: !GetAtt UpdateRole.Arn
+
+  SyncScheduleRuleArn:
+    Description: ARN of the EventBridge rule that triggers synchronization.
+    Value: !GetAtt SyncScheduleRule.Arn

@@ -1,0 +1,2 @@
+# The Lambda runtime provides boto3 and the Python standard library.
+PyYAML>=6.0

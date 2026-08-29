@@ -1,0 +1,22 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Artifact bucket and a broad CloudFormation service role for operator deploys and deletes of the ipallow stack.
+
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ipallow-220087710539-us-west-2
+
+  CfnAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ipallow-cfn-admin
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
